@@ -1,13 +1,12 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
-	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -24,29 +23,24 @@ type Config struct {
 	HTTPPort    int    `json:"http_port"`
 	HTTPSPort   int    `json:"https_port"`
 	BufferSize  int    `json:"buffer_size"`
+	GatewayPort int    `json:"gateway_port"`
 	PacketQueue int    `json:"packet_queue"`
-}
-
-// FilterRule represents filtering rules for packets
-type FilterRule struct {
-	Protocol string `json:"protocol"` // "tcp", "udp"
-	Port     uint16 `json:"port"`
-	Action   string `json:"action"` // "forward", "drop", "bypass"
-	RemoteIP string `json:"remote_ip"`
 }
 
 // ProxyConnection represents a proxy connection
 type ProxyConnection struct {
 	OriginalDest string
+	ClientConn   net.Conn
 	ProxyConn    net.Conn
 	CreatedAt    time.Time
 	LastUsed     time.Time
+	Host         string
+	Port         int
 }
 
-// Gateway represents the WinDivert gateway
+// Gateway represents the network gateway
 type Gateway struct {
 	config         *Config
-	rules          []FilterRule
 	ctx            context.Context
 	cancel         context.CancelFunc
 	wg             sync.WaitGroup
@@ -56,6 +50,7 @@ type Gateway struct {
 	connPoolMutex  sync.RWMutex
 	connPoolSize   int
 	connPoolExpiry time.Duration
+	serverListener net.Listener
 }
 
 // NewGateway creates a new Gateway instance
@@ -71,17 +66,11 @@ func NewGateway(configPath string) (*Gateway, error) {
 		config:         config,
 		ctx:            ctx,
 		cancel:         cancel,
-		logger:         log.New(os.Stdout, "[WinDivert Gateway] ", log.LstdFlags|log.Lshortfile),
+		logger:         log.New(os.Stdout, "[Gateway] ", log.LstdFlags|log.Lshortfile),
 		running:        false,
 		proxyConns:     make(map[string]*ProxyConnection),
 		connPoolSize:   100,
 		connPoolExpiry: 5 * time.Minute,
-	}
-
-	gw.rules = []FilterRule{
-		{Protocol: "tcp", Port: 80, Action: "forward"},  // HTTP
-		{Protocol: "tcp", Port: 443, Action: "forward"}, // HTTPS
-		{Protocol: "udp", Port: 53, Action: "bypass"},   // DNS
 	}
 
 	return gw, nil
@@ -99,26 +88,35 @@ func loadConfig(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 
+	// Set defaults
+	if config.BufferSize == 0 {
+		config.BufferSize = 8192
+	}
+	if config.GatewayPort == 0 {
+		config.GatewayPort = 8080
+	}
+	if config.PacketQueue == 0 {
+		config.PacketQueue = 1000
+	}
+
 	return &config, nil
 }
 
 // Start starts the gateway
 func (g *Gateway) Start() error {
-	g.logger.Println("Starting WinDivert Gateway...")
+	g.logger.Println("Starting Network Gateway...")
 
-	// Initialize gateway (simplified - no WinDivert dependency)
-	err := g.initGateway()
+	// Start HTTP server for proxy interception
+	err := g.startProxyServer()
 	if err != nil {
-		return fmt.Errorf("failed to initialize gateway: %w", err)
+		return fmt.Errorf("failed to start proxy server: %w", err)
 	}
 
 	// Start connection pool cleanup
 	go g.cleanupConnectionPool()
 
-	// Start packet processing goroutines (simplified)
-	g.wg.Add(2)
-	go g.packetProcessor()
-	go g.proxyHandler()
+	// Start status monitoring
+	go g.statusMonitor()
 
 	// Setup signal handling
 	go g.handleSignals()
@@ -126,8 +124,7 @@ func (g *Gateway) Start() error {
 	g.running = true
 	g.logger.Printf("Gateway started successfully")
 	g.logger.Printf("Proxy address: %s", g.config.ProxyAddr)
-	g.logger.Printf("Buffer size: %d, Packet queue: %d", g.config.BufferSize, g.config.PacketQueue)
-	g.logger.Printf("Connection pool size: %d, Expiry: %v", g.connPoolSize, g.connPoolExpiry)
+	g.logger.Printf("Gateway listening on: 0.0.0.0:%d", g.config.GatewayPort)
 
 	return nil
 }
@@ -141,76 +138,317 @@ func (g *Gateway) Stop() {
 	g.logger.Println("Stopping gateway...")
 	g.running = false
 	g.cancel()
-	g.wg.Wait()
+
+	if g.serverListener != nil {
+		g.serverListener.Close()
+	}
 
 	// Close all proxy connections
 	g.connPoolMutex.Lock()
 	for _, conn := range g.proxyConns {
+		if conn.ClientConn != nil {
+			conn.ClientConn.Close()
+		}
 		if conn.ProxyConn != nil {
 			conn.ProxyConn.Close()
 		}
 	}
 	g.connPoolMutex.Unlock()
+
+	g.wg.Wait()
 }
 
-// initGateway initializes the gateway (simplified)
-func (g *Gateway) initGateway() error {
-	g.logger.Println("Initializing Gateway...")
+// startProxyServer starts the proxy server
+func (g *Gateway) startProxyServer() error {
+	var err error
+	g.serverListener, err = net.Listen("tcp", fmt.Sprintf(":%d", g.config.GatewayPort))
+	if err != nil {
+		return err
+	}
+
+	g.wg.Add(1)
+	go func() {
+		defer g.wg.Done()
+		g.acceptConnections()
+	}()
+
 	return nil
 }
 
-// packetProcessor processes packets (simplified simulation)
-func (g *Gateway) packetProcessor() {
+// acceptConnections accepts incoming connections
+func (g *Gateway) acceptConnections() {
+	g.logger.Printf("Accepting connections on port %d", g.config.GatewayPort)
+
+	for {
+		conn, err := g.serverListener.Accept()
+		if err != nil {
+			if g.ctx.Err() != nil {
+				return
+			}
+			g.logger.Printf("Error accepting connection: %v", err)
+			continue
+		}
+
+		g.wg.Add(1)
+		go g.handleConnection(conn)
+	}
+}
+
+// handleConnection handles a client connection
+func (g *Gateway) handleConnection(clientConn net.Conn) {
 	defer g.wg.Done()
+	defer clientConn.Close()
 
-	g.logger.Println("Packet processor started (simulation mode)")
+	// Read the initial request
+	buf := make([]byte, g.config.BufferSize)
+	n, err := clientConn.Read(buf)
+	if err != nil {
+		g.logger.Printf("Error reading request: %v", err)
+		return
+	}
 
-	ticker := time.NewTicker(10 * time.Second)
+	request := buf[:n]
+	g.logger.Printf("Received request: %s", strings.TrimSpace(string(request[:min(100, n)])))
+
+	// Parse the request to determine if it's HTTP or HTTPS
+	if strings.Contains(string(request), "CONNECT") {
+		g.handleCONNECTRequest(clientConn, request)
+	} else {
+		g.handleHTTPRequest(clientConn, request)
+	}
+}
+
+// handleHTTPRequest handles HTTP requests
+func (g *Gateway) handleHTTPRequest(clientConn net.Conn, request []byte) {
+	// Parse HTTP request to get target URL
+	targetURL, err := g.parseHTTPRequest(string(request))
+	if err != nil {
+		g.logger.Printf("Failed to parse HTTP request: %v", err)
+		clientConn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		return
+	}
+
+	g.logger.Printf("HTTP request to: %s", targetURL)
+
+	// Forward request to proxy
+	err = g.forwardToProxy(clientConn, targetURL, request, "")
+	if err != nil {
+		g.logger.Printf("Failed to forward HTTP request: %v", err)
+		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return
+	}
+}
+
+// handleCONNECTRequest handles HTTPS CONNECT requests
+func (g *Gateway) handleCONNECTRequest(clientConn net.Conn, request []byte) {
+	// Parse CONNECT request
+	targetHost, targetPort, err := g.parseCONNECTRequest(string(request))
+	if err != nil {
+		g.logger.Printf("Failed to parse CONNECT request: %v", err)
+		clientConn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		return
+	}
+
+	targetAddr := fmt.Sprintf("%s:%d", targetHost, targetPort)
+	g.logger.Printf("HTTPS CONNECT to: %s", targetAddr)
+
+	// Send 200 Connection Established
+	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+
+	// Forward to proxy
+	err = g.forwardToProxy(clientConn, targetAddr, request, targetHost)
+	if err != nil {
+		g.logger.Printf("Failed to forward CONNECT request: %v", err)
+	}
+}
+
+// forwardToProxy forwards data to proxy server
+func (g *Gateway) forwardToProxy(clientConn net.Conn, targetAddr string, initialRequest []byte, targetHost string) error {
+	// Connect to proxy
+	proxyConn, err := net.Dial("tcp", g.config.ProxyAddr)
+	if err != nil {
+		return fmt.Errorf("failed to connect to proxy: %w", err)
+	}
+	defer proxyConn.Close()
+
+	// If it's not a CONNECT request, modify the request to go through proxy
+	if !strings.Contains(string(initialRequest), "CONNECT") {
+		modifiedRequest := g.modifyRequestForProxy(string(initialRequest), targetAddr)
+		_, err = proxyConn.Write([]byte(modifiedRequest))
+		if err != nil {
+			return fmt.Errorf("failed to write request to proxy: %w", err)
+		}
+	} else {
+		// For CONNECT requests, just forward the original
+		_, err = proxyConn.Write(initialRequest)
+		if err != nil {
+			return fmt.Errorf("failed to write CONNECT to proxy: %w", err)
+		}
+	}
+
+	// Setup bidirectional forwarding
+	return g.setupBidirectionalForward(clientConn, proxyConn)
+}
+
+// modifyRequestForProxy modifies HTTP request to route through proxy
+func (g *Gateway) modifyRequestForProxy(request, targetURL string) string {
+	lines := strings.Split(request, "\r\n")
+
+	for i, line := range lines {
+		if strings.HasPrefix(strings.ToUpper(line), "PROXY-CONNECTION:") {
+			lines[i] = "Connection: close"
+		} else if strings.HasPrefix(line, "Connection:") {
+			lines[i] = "Connection: close"
+		} else if strings.HasPrefix(line, "Proxy-Connection:") {
+			lines[i] = "Connection: close"
+		}
+	}
+
+	return strings.Join(lines, "\r\n")
+}
+
+// setupBidirectionalForward sets up bidirectional data forwarding
+func (g *Gateway) setupBidirectionalForward(clientConn, proxyConn net.Conn) error {
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Forward client -> proxy
+	go func() {
+		defer wg.Done()
+		_, err := io.Copy(proxyConn, clientConn)
+		if err != nil {
+			g.logger.Printf("Client to proxy forwarding error: %v", err)
+		}
+		proxyConn.Close()
+	}()
+
+	// Forward proxy -> client
+	go func() {
+		defer wg.Done()
+		_, err := io.Copy(clientConn, proxyConn)
+		if err != nil {
+			g.logger.Printf("Proxy to client forwarding error: %v", err)
+		}
+		clientConn.Close()
+	}()
+
+	wg.Wait()
+	return nil
+}
+
+// parseHTTPRequest parses HTTP request to extract target URL
+func (g *Gateway) parseHTTPRequest(request string) (string, error) {
+	lines := strings.Split(request, "\r\n")
+	if len(lines) == 0 {
+		return "", fmt.Errorf("empty request")
+	}
+
+	// Parse request line
+	parts := strings.Fields(lines[0])
+	if len(parts) < 3 {
+		return "", fmt.Errorf("invalid request line")
+	}
+
+	// method := parts[0] // not used currently
+	url := parts[1]
+
+	// If absolute URL, use as is
+	if strings.HasPrefix(url, "http://") {
+		return url, nil
+	}
+
+	// For relative URLs, extract Host header
+	host := ""
+	for _, line := range lines {
+		if strings.HasPrefix(strings.ToLower(line), "host:") {
+			host = strings.TrimSpace(line[5:])
+			break
+		}
+	}
+
+	if host == "" {
+		return "", fmt.Errorf("no host header found")
+	}
+
+	return fmt.Sprintf("http://%s%s", host, url), nil
+}
+
+// parseCONNECTRequest parses CONNECT request
+func (g *Gateway) parseCONNECTRequest(request string) (string, int, error) {
+	lines := strings.Split(request, "\r\n")
+	if len(lines) == 0 {
+		return "", 0, fmt.Errorf("empty request")
+	}
+
+	// Parse request line
+	parts := strings.Fields(lines[0])
+	if len(parts) < 3 || parts[0] != "CONNECT" {
+		return "", 0, fmt.Errorf("invalid CONNECT request")
+	}
+
+	hostPort := parts[1]
+	host, portStr, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		// If no port specified, assume 443
+		host = hostPort
+		portStr = "443"
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid port: %s", portStr)
+	}
+
+	return host, port, nil
+}
+
+// cleanupConnectionPool periodically cleans up old connections
+func (g *Gateway) cleanupConnectionPool() {
+	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-g.ctx.Done():
-			g.logger.Println("Packet processor stopping...")
 			return
 		case <-ticker.C:
-			g.logger.Printf("Processing simulated packets... Active connections: %d", len(g.proxyConns))
-
-			// Simulate some proxy connections for demonstration
-			if len(g.proxyConns) < 5 {
-				flowKey := fmt.Sprintf("sim-flow-%d", time.Now().UnixNano()%1000000)
-				proxyAddr := g.config.ProxyAddr
-
-				proxyConn, err := net.Dial("tcp", proxyAddr)
-				if err == nil {
-					conn := &ProxyConnection{
-						OriginalDest: "example.com:80",
-						ProxyConn:    proxyConn,
-						CreatedAt:    time.Now(),
-						LastUsed:     time.Now(),
-					}
-					g.proxyConns[flowKey] = conn
-					g.logger.Printf("Created simulated connection for flow: %s", flowKey)
-				}
-			}
+			g.cleanupOldConnections()
 		}
 	}
 }
 
-// proxyHandler handles proxy connections and management
-func (g *Gateway) proxyHandler() {
-	defer g.wg.Done()
+// cleanupOldConnections removes expired connections
+func (g *Gateway) cleanupOldConnections() {
+	g.connPoolMutex.Lock()
+	defer g.connPoolMutex.Unlock()
 
-	g.logger.Println("Proxy handler started")
+	now := time.Now()
+	expiredCount := 0
+	for key, conn := range g.proxyConns {
+		if now.Sub(conn.LastUsed) > g.connPoolExpiry {
+			if conn.ClientConn != nil {
+				conn.ClientConn.Close()
+			}
+			if conn.ProxyConn != nil {
+				conn.ProxyConn.Close()
+			}
+			delete(g.proxyConns, key)
+			expiredCount++
+		}
+	}
+	if expiredCount > 0 {
+		g.logger.Printf("Cleaned up %d expired connections", expiredCount)
+	}
+}
 
-	// Periodic status checks
+// statusMonitor monitors gateway status
+func (g *Gateway) statusMonitor() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-g.ctx.Done():
-			g.logger.Println("Proxy handler stopping...")
 			return
 		case <-ticker.C:
 			if g.running {
@@ -239,146 +477,12 @@ func (g *Gateway) GetStatus() map[string]interface{} {
 	return map[string]interface{}{
 		"running":          g.running,
 		"proxy_addr":       g.config.ProxyAddr,
+		"gateway_port":     g.config.GatewayPort,
 		"buffer_size":      g.config.BufferSize,
-		"packet_queue":     g.config.PacketQueue,
-		"rules_count":      len(g.rules),
 		"active_conns":     len(g.proxyConns),
 		"conn_pool_size":   g.connPoolSize,
 		"conn_pool_expiry": g.connPoolExpiry.String(),
 	}
-}
-
-// cleanupConnectionPool periodically cleans up old connections
-func (g *Gateway) cleanupConnectionPool() {
-	ticker := time.NewTicker(1 * time.Minute)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-g.ctx.Done():
-			return
-		case <-ticker.C:
-			g.cleanupOldConnections()
-		}
-	}
-}
-
-// cleanupOldConnections removes expired connections
-func (g *Gateway) cleanupOldConnections() {
-	g.connPoolMutex.Lock()
-	defer g.connPoolMutex.Unlock()
-
-	now := time.Now()
-	expiredCount := 0
-	for flowKey, conn := range g.proxyConns {
-		if now.Sub(conn.LastUsed) > g.connPoolExpiry {
-			if conn.ProxyConn != nil {
-				conn.ProxyConn.Close()
-			}
-			delete(g.proxyConns, flowKey)
-			expiredCount++
-		}
-	}
-	if expiredCount > 0 {
-		g.logger.Printf("Cleaned up %d expired connections", expiredCount)
-	}
-}
-
-// Test packet processing functions
-func (g *Gateway) testPacketProcessing() {
-	// Test HTTP request parsing
-	httpRequest := "GET http://example.com/path HTTP/1.1\r\nHost: example.com\r\n\r\n"
-	host, port, err := g.parseHTTPRequest([]byte(httpRequest))
-	if err == nil {
-		g.logger.Printf("HTTP test: Host=%s, Port=%d", host, port)
-	}
-
-	// Test HTTPS CONNECT parsing
-	connectRequest := "CONNECT example.com:443 HTTP/1.1\r\n\r\n"
-	host, port, err = g.parseCONNECTRequest([]byte(connectRequest))
-	if err == nil {
-		g.logger.Printf("CONNECT test: Host=%s, Port=%d", host, port)
-	}
-}
-
-// HTTP request parsing
-func (g *Gateway) parseHTTPRequest(payload []byte) (string, int, error) {
-	reader := bufio.NewReader(strings.NewReader(string(payload)))
-
-	// Read first line (GET / HTTP/1.1)
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		return "", 0, err
-	}
-
-	// Parse request line
-	parts := strings.Fields(line)
-	if len(parts) < 3 {
-		return "", 0, fmt.Errorf("invalid HTTP request")
-	}
-
-	// Extract URL from request
-	urlStr := parts[1]
-	if urlStr == "*" {
-		return "", 0, fmt.Errorf("invalid URL in request")
-	}
-
-	// Parse URL
-	if !strings.HasPrefix(urlStr, "http://") {
-		urlStr = "http://" + urlStr
-	}
-
-	u, err := url.Parse(urlStr)
-	if err != nil {
-		return "", 0, err
-	}
-
-	// Extract host and port
-	host := u.Hostname()
-	port := u.Port()
-	if port == "" {
-		port = "80"
-	}
-
-	portInt, err := strconv.Atoi(port)
-	if err != nil {
-		return "", 0, fmt.Errorf("invalid port: %s", port)
-	}
-	return host, portInt, nil
-}
-
-// CONNECT request parsing
-func (g *Gateway) parseCONNECTRequest(payload []byte) (string, int, error) {
-	reader := bufio.NewReader(strings.NewReader(string(payload)))
-
-	// Read first line (CONNECT example.com:443 HTTP/1.1)
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		return "", 0, err
-	}
-
-	// Parse CONNECT request line
-	parts := strings.Fields(line)
-	if len(parts) < 3 || parts[0] != "CONNECT" {
-		return "", 0, fmt.Errorf("invalid CONNECT request")
-	}
-
-	// Extract host:port from CONNECT request
-	hostPort := parts[1]
-	host, port, err := net.SplitHostPort(hostPort)
-	if err != nil {
-		return "", 0, err
-	}
-
-	if port == "" {
-		port = "443"
-	}
-
-	portInt, err := strconv.Atoi(port)
-	if err != nil {
-		return "", 0, fmt.Errorf("invalid port: %s", port)
-	}
-	return host, portInt, nil
 }
 
 func main() {
@@ -401,13 +505,19 @@ func main() {
 	}
 
 	gateway.logger.Printf("Gateway status: %+v", gateway.GetStatus())
-	gateway.logger.Println("Gateway is running (simulation mode). Press Ctrl+C to stop.")
-
-	// Test packet processing functions
-	gateway.testPacketProcessing()
+	gateway.logger.Println("Gateway is running. Press Ctrl+C to stop.")
+	gateway.logger.Println("Configure your applications to use this gateway as HTTP/HTTPS proxy")
 
 	// Wait for shutdown signal
 	<-gateway.ctx.Done()
 	gateway.Stop()
 	gateway.logger.Println("Gateway stopped gracefully")
+}
+
+// Helper function to get minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
