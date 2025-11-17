@@ -1,8 +1,4 @@
 {
   "proxy_addr": "proxy.company.com:8080",
-  "local_addr": "0.0.0.0",
-  "http_port": 80,
-  "https_port": 443,
-  "buffer_size": 262140,
-  "packet_queue": 5000
+  "buffer_size": 262140
 }

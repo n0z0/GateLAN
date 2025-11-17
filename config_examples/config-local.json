@@ -1,8 +1,4 @@
 {
   "proxy_addr": "127.0.0.1:8080",
-  "local_addr": "127.0.0.1",
-  "http_port": 80,
-  "https_port": 443,
-  "buffer_size": 65535,
-  "packet_queue": 1000
+  "buffer_size": 8192
 }
